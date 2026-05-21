@@ -492,6 +492,53 @@ async function calcLiabilityData() {
 const app = express();
 app.use(express.json({ limit: "2mb" }));
 
+// ── Security: API Key, CORS, Headers ─────────────────────────────────────────
+const API_KEY = process.env.API_KEY || "";
+
+// Security headers for all responses
+app.use((_req, res, next) => {
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  res.setHeader("X-Frame-Options", "DENY");
+  res.setHeader("X-XSS-Protection", "1; mode=block");
+  next();
+});
+
+// CORS configuration
+app.use((req, res, next) => {
+  const allowedOrigins = ["https://ps-vibe.com", "http://ps-vibe.com", "http://localhost", "http://localhost:3000", "http://127.0.0.1", "http://127.0.0.1:3000"];
+  const origin = req.headers.origin;
+  if (origin && allowedOrigins.some(o => origin.startsWith(o))) {
+    res.setHeader("Access-Control-Allow-Origin", origin);
+  } else if (!origin) {
+    // Allow requests with no Origin header (server-to-server, curl, bots)
+    res.setHeader("Access-Control-Allow-Origin", "https://ps-vibe.com");
+  }
+  res.setHeader("Access-Control-Allow-Methods", "GET, POST, PATCH, DELETE, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, X-API-Key, X-Receipt-Secret");
+  if (req.method === "OPTIONS") return res.sendStatus(204);
+  next();
+});
+
+// API Key authentication middleware
+// Public endpoints (no key required): GET /api/receipt/:id, GET /api/healthz, OPTIONS
+// All other endpoints require valid X-API-Key header
+function requireApiKey(req, res, next) {
+  // Skip if no API_KEY configured (backward compat during rollout)
+  if (!API_KEY) return next();
+  // Public endpoints - no auth needed
+  const publicPaths = [
+    /^\/api\/receipt\/[^/]+$/,   // GET receipt view
+    /^\/api\/healthz$/,          // health check
+  ];
+  if (req.method === "GET" && publicPaths.some(p => p.test(req.path))) return next();
+  // Check API key
+  const provided = req.headers["x-api-key"];
+  if (provided === API_KEY) return next();
+  return res.status(401).json({ error: "Unauthorized: invalid or missing API key" });
+}
+app.use(requireApiKey);
+
+
 // ── In-memory receipt store ───────────────────────────────────────────────────
 const memoryStore = new Map();
 
@@ -2279,12 +2326,77 @@ app.post("/api/waitlist/notify", async (req, res) => {
   } catch(e) { res.status(500).json({ error: String(e) }); }
 });
 
+// ══════════════════════════════════════════════════════════════════════════════
+// REAL-TIME CACHE INVALIDATION — Customer Bot integration
+// ══════════════════════════════════════════════════════════════════════════════
+
+// In-memory queue for pending cache invalidations (customer bot polls this)
+let _cacheInvalidationQueue = [];
+
+// POST /api/cache-invalidate?keys=games,config,promotions
+// Triggered by n8n or admin when Google Sheets data changes
+app.post("/api/cache-invalidate", (req, res) => {
+  try {
+    const keysParam = req.query.keys || "";
+    const keys = keysParam.split(",").map(k => k.trim()).filter(k => k);
+    
+    if (!keys.length) {
+      return res.status(400).json({ error: "No keys specified" });
+    }
+    
+    // Add to queue (customer bot will poll and clear this)
+    _cacheInvalidationQueue.push({
+      keys,
+      timestamp: new Date().toISOString(),
+    });
+    
+    console.log(`[cache-invalidate] Queued: ${keys.join(", ")}`);
+    res.json({ success: true, keys, queued: _cacheInvalidationQueue.length });
+  } catch(e) {
+    res.status(500).json({ error: String(e) });
+  }
+});
+
+// GET /api/cache-invalidations
+// Customer bot polls this endpoint (every 5 sec) to get pending invalidations
+app.get("/api/cache-invalidations", (req, res) => {
+  try {
+    if (_cacheInvalidationQueue.length === 0) {
+      return res.json({ keys: [] });
+    }
+    
+    // Return first item in queue
+    const item = _cacheInvalidationQueue[0];
+    res.json({ keys: item.keys, timestamp: item.timestamp });
+  } catch(e) {
+    res.status(500).json({ error: String(e) });
+  }
+});
+
+// POST /api/cache-invalidations/ack
+// Customer bot acknowledges after processing invalidation
+app.post("/api/cache-invalidations/ack", (req, res) => {
+  try {
+    if (_cacheInvalidationQueue.length > 0) {
+      const removed = _cacheInvalidationQueue.shift();
+      console.log(`[cache-invalidations/ack] Processed: ${removed.keys.join(", ")}`);
+    }
+    res.json({ success: true, remaining: _cacheInvalidationQueue.length });
+  } catch(e) {
+    res.status(500).json({ error: String(e) });
+  }
+});
+
 // GET /api/healthz
 app.get("/api/healthz", (_req, res) => res.json({ ok: true, uptime: process.uptime() }));
 
 // ── Startup ───────────────────────────────────────────────────────────────────
 process.on("uncaughtException",  e => console.error("UncaughtException:", e.message));
 process.on("unhandledRejection", r => console.error("UnhandledRejection:", r));
+
+// ── Auto-trigger cache invalidation on Google Sheets changes ─────────────────
+// This can be called by n8n workflows when data changes
+// For now, we rely on manual POST /api/cache-invalidate calls from n8n
 
 // ── Waitlist auto-expire timer (every 5 min) ─────────────────────────────────
 // Find "notified" entries older than 15 min → mark expired → cascade FIFO notify.
