@@ -1,0 +1,8 @@
+.env
+service_account.json
+__pycache__/
+*.pyc
+*.pyo
+*.log
+receipts/
+node_modules/
