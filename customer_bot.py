@@ -36,6 +36,7 @@ def today_mmt(): return now_mmt().strftime("%-m/%-d/%Y")
 
 CUSTOMER_BOT_TOKEN  = os.environ["CUSTOMER_BOT_TOKEN"]
 API_BASE            = ""
+_API_KEY            = ""
 STAFF_NOTIFY_CHAT   = os.environ.get("STAFF_NOTIFY_CHAT", "")
 N8N_BOOKING_WEBHOOK = os.environ.get("N8N_BOOKING_WEBHOOK", "")
 GEMINI_API_KEY      = os.environ.get("GEMINI_API_KEY", "")
@@ -460,7 +461,7 @@ def _get_gemini_client():
         return None
     try:
         _gemini_client = _genai.Client(api_key=GEMINI_API_KEY)
-        logging.info("Gemini AI client ready (gemini-2.5-flash-lite)")
+        logging.info("Gemini AI client ready (gemini-3.5-flash)")
     except Exception as e:
         logging.error("Gemini client init failed: %s", e)
     return _gemini_client
@@ -592,7 +593,7 @@ async def log_to_sheet(user_name: str, user_query: str, ai_response: str, sentim
             r = _req.Request(
                 f"{API_BASE}/api/sheets/log",
                 data=payload,
-                headers={"Content-Type": "application/json"},
+                headers={"Content-Type": "application/json", "X-API-Key": _API_KEY},
                 method="POST",
             )
             with _req.urlopen(r, timeout=8):
@@ -681,7 +682,7 @@ def _create_booking_fn(date: str, time_slot: str, player_count: int,
     r = _req.Request(
         f"{API_BASE}/api/bookings",
         data=data,
-        headers={"Content-Type": "application/json"},
+        headers={"Content-Type": "application/json", "X-API-Key": _API_KEY},
         method="POST",
     )
     try:
@@ -896,7 +897,8 @@ def _api_get(path: str):
         logging.warning("api_get: API_BASE not set")
         return None
     try:
-        with _req.urlopen(f"{API_BASE}/api/{path}", timeout=15) as r:
+        _rg = _req.Request(f"{API_BASE}/api/{path}", headers={"X-API-Key": _API_KEY})
+        with _req.urlopen(_rg, timeout=15) as r:
             return json.load(r)
     except Exception as e:
         logging.warning("api_get %s: %s", path, e)
@@ -910,7 +912,7 @@ def _api_post(path: str, body: dict):
     try:
         data = json.dumps(body).encode()
         r = _req.Request(f"{API_BASE}/api/{path}", data=data,
-                         headers={"Content-Type": "application/json"}, method="POST")
+                         headers={"Content-Type": "application/json", "X-API-Key": _API_KEY}, method="POST")
         with _req.urlopen(r, timeout=15) as resp:
             return json.load(resp)
     except _urlerr.HTTPError as e:
@@ -933,7 +935,7 @@ def _api_patch(path: str, body: dict):
     try:
         data = json.dumps(body).encode()
         r = _req.Request(f"{API_BASE}/api/{path}", data=data,
-                         headers={"Content-Type": "application/json"}, method="PATCH")
+                         headers={"Content-Type": "application/json", "X-API-Key": _API_KEY}, method="PATCH")
         with _req.urlopen(r, timeout=15) as resp:
             return json.loads(resp.read())
     except _urlerr.HTTPError as e:
@@ -2087,7 +2089,7 @@ def _api_delete(path: str):
         return None
     import urllib.error as _urlerr
     try:
-        r = _req.Request(f"{API_BASE}/api/{path}", method="DELETE")
+        r = _req.Request(f"{API_BASE}/api/{path}", headers={"X-API-Key": _API_KEY}, method="DELETE")
         with _req.urlopen(r, timeout=10) as resp:
             return json.load(resp)
     except _urlerr.HTTPError as e:
@@ -3217,6 +3219,39 @@ _reminders_sent, _checkins_sent = _load_sent_sets()
 _autocancels_done: set[int] = set()
 
 
+# Real-time cache invalidation (fire-and-forget, non-blocking)
+
+async def _invalidate_cache_async(keys: list):
+    """Async fire-and-forget cache invalidation - does NOT block user response."""
+    for key in keys:
+        _CACHE.pop(key, None)
+    logging.info("Cache invalidated (async): %s", keys)
+
+
+async def _cache_invalidation_listener():
+    """Background task: Listen for cache invalidation signals from API.
+    Runs every 5 seconds, checks for pending invalidations, clears cache async.
+    Does NOT block main bot operations.
+    """
+    await asyncio.sleep(5)  # warm-up delay
+    while True:
+        try:
+            # Check if API has pending cache invalidations
+            data = await asyncio.to_thread(_api_get, "cache-invalidations")
+            if data and isinstance(data, dict):
+                keys = data.get("keys", [])
+                if keys:
+                    # Fire-and-forget invalidation
+                    await _invalidate_cache_async(keys)
+                    # Acknowledge to API (fire-and-forget)
+                    asyncio.create_task(asyncio.to_thread(_api_post, "cache-invalidations/ack", {}))
+        except Exception as e:
+            logging.debug("Cache invalidation listener error (non-blocking): %s", e)
+        
+        # Check every 5 seconds (lightweight)
+        await asyncio.sleep(5)
+
+
 async def _booking_scheduler():
     """Every 60 s: reminders, check-in prompts, auto-cancel.
 
@@ -3856,7 +3891,7 @@ async def _ai_reply(update: Update, context: ContextTypes.DEFAULT_TYPE, user_tex
                 for attempt in range(retries):
                     try:
                         return client.models.generate_content(
-                            model="gemini-2.5-flash-lite",
+                            model="gemini-3.5-flash",
                             contents=contents,
                             config=config,
                         )
@@ -4089,9 +4124,10 @@ async def handle_menu_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE
 # ══════════════════════════════════════════════════════════════════════════════
 
 def main():
-    global API_BASE
+    global API_BASE, _API_KEY
     # Prefer explicit API_BASE_URL env var (VPS); fall back to REPLIT_DOMAINS for legacy
     API_BASE = os.environ.get("API_BASE_URL", "").rstrip("/")
+    _API_KEY = os.environ.get("API_KEY", "")
     if not API_BASE:
         domains = os.environ.get("REPLIT_DOMAINS", "")
         domain  = domains.split(",")[0].strip() if domains else ""
@@ -4107,7 +4143,8 @@ def main():
         await a.bot.delete_my_commands()
         await _warm_cache()
         asyncio.create_task(_booking_scheduler())
-        logging.info("Booking scheduler started | Commands registered")
+        asyncio.create_task(_cache_invalidation_listener())
+        logging.info("Booking scheduler started | Cache listener started | Commands registered")
 
     app = (
         Application.builder()
